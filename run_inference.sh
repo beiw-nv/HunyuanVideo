@@ -17,7 +17,7 @@ export PATH_TO=${SCRIPTPATH}/ckpts/hunyuan-video-t2v-720p/transformers
 export DIT_CKPT_PATH=${PATH_TO}/mp_rank_00_model_states_fp8.pt
 
 PROFILE_PATH=${SCRIPTPATH}
-ATTN=fa
+ATTN=cute
 PROFILE_FILE=hunyuanvideo_inference_${ATTN}_b200
 
 if [ $MULTI_GPU -eq 0 ]; then

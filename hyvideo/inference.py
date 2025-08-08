@@ -28,6 +28,7 @@ try:
         initialize_model_parallel,
         init_distributed_environment
     )
+    from yunchang.kernels import AttnType
 except:
     xfuser = None
     get_sequence_parallel_world_size = None
@@ -80,7 +81,10 @@ def parallelize_transformer(pipe):
         from xfuser.core.long_ctx_attention import xFuserLongContextAttention
         
         for block in transformer.double_blocks + transformer.single_blocks:
-            block.hybrid_seq_parallel_attn = xFuserLongContextAttention()
+            #block.hybrid_seq_parallel_attn = xFuserLongContextAttention()
+            #block.hybrid_seq_parallel_attn = xFuserLongContextAttention(ring_impl_type="basic_flashinfer", attn_type=AttnType.FLASHINFER) #flasinfer backend
+            #block.hybrid_seq_parallel_attn = xFuserLongContextAttention(ring_impl_type="basic", attn_type=AttnType.TORCH) # torch cudnn backend
+            block.hybrid_seq_parallel_attn = xFuserLongContextAttention(ring_impl_type="basic", attn_type=AttnType.FA_CUTE) # FA3 (cutlass backend)
 
         output = original_forward(
             x,

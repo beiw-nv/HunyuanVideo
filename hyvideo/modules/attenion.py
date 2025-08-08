@@ -5,6 +5,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import os
+#os.environ["NVTE_FUSED_ATTN"] = "1"
+#os.environ["NVTE_FUSED_ATTN_BACKEND"] = "1"
+#os.environ["NVTE_FLASH_ATTN"] = "0"
+#os.environ["NVTE_FUSED_ATTN_USE_FAv2_BWD"] = "0"
+
+from transformer_engine.pytorch import attention as te
+
 try:
     import flash_attn
     from flash_attn.flash_attn_interface import _flash_attn_forward
@@ -23,6 +31,10 @@ MEMORY_LAYOUT = {
     "torch": (
         lambda x: x.transpose(1, 2),
         lambda x: x.transpose(1, 2),
+    ),
+    "cudnn": (
+        lambda x: x,
+        lambda x: x,
     ),
     "vanilla": (
         lambda x: x.transpose(1, 2),
@@ -61,7 +73,7 @@ def attention(
     q,
     k,
     v,
-    mode="flash",
+    mode="cudnn",
     drop_rate=0,
     attn_mask=None,
     causal=False,
@@ -101,29 +113,11 @@ def attention(
     if mode == "torch":
         if attn_mask is not None and attn_mask.dtype != torch.bool:
             attn_mask = attn_mask.to(q.dtype)
-        if cu_seqlens_q is None:
-            x = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, dropout_p=drop_rate, is_causal=causal
-            )
-        else:
-            attn1 = F.scaled_dot_product_attention(
-                q[:, :, :cu_seqlens_q[1]],
-                k[:, :, :cu_seqlens_kv[1]],
-                v[:, :, :cu_seqlens_kv[1]],
-                attn_mask=attn_mask,
-                dropout_p=drop_rate,
-                is_causal=causal
-            )
-            attn2 = F.scaled_dot_product_attention(
-                q[:, :, cu_seqlens_q[1]:],
-                k[:, :, cu_seqlens_kv[1]:],
-                v[:, :, cu_seqlens_kv[1]:],
-                attn_mask=None,
-                dropout_p=drop_rate,
-                is_causal=False
-            )
-            x = torch.cat([attn1, attn2], dim=2)
+        x = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, dropout_p=drop_rate, is_causal=causal
+        )
     elif mode == "flash":
+        print("call flash attention 2")
         x = flash_attn_varlen_func(
             q,
             k,
@@ -137,6 +131,31 @@ def attention(
         x = x.view(
             batch_size, max_seqlen_q, x.shape[-2], x.shape[-1]
         )  # reshape x to [b, s, a, d]
+    elif mode == "cudnn":
+        print("call TE cudnn attention backend")
+        os.environ["NVTE_FUSED_ATTN"] = "1"
+        os.environ["NVTE_FUSED_ATTN_BACKEND"] = "1"
+        
+        te_do_prod_attn = te.DotProductAttention(
+            num_attention_heads=q.shape[2],
+            kv_channels=q.shape[3],
+            num_gqa_groups=k.shape[2],
+            attn_mask_type="padding",
+            softmax_scale=1.0,
+            attention_dropout=0.0,
+            qkv_format="bshd"
+        )
+        
+        x = te_do_prod_attn(query_layer=q,
+                            key_layer=k,
+                            value_layer=v,
+                            cu_seqlens_q=cu_seqlens_q,
+                            cu_seqlens_kv=cu_seqlens_kv,
+                            max_seqlen_q=max_seqlen_q,
+                            max_seqlen_kv=max_seqlen_kv,
+                            attn_mask_type="padding")
+        #print(f"te cudnn attention output shape {x.shape}")
+        
     elif mode == "vanilla":
         scale_factor = 1 / math.sqrt(q.size(-1))
 
@@ -170,8 +189,12 @@ def attention(
         raise NotImplementedError(f"Unsupported attention mode: {mode}")
 
     x = post_attn_layout(x)
-    b, s, a, d = x.shape
-    out = x.reshape(b, s, -1)
+    if mode == "cudnn":
+        out = x
+    else:
+        b, s, a, d = x.shape
+        out = x.reshape(b, s, -1)
+        
     return out
 
 
