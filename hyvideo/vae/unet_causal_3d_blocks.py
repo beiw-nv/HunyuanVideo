@@ -33,6 +33,42 @@ from diffusers.models.normalization import RMSNorm
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
+import torch
+import time
+
+def prepare_causal_attention_mask_vectorized(n_frame: int, n_hw: int, dtype, device, batch_size: int = None):
+    seq_len = n_frame * n_hw
+    
+    # 1. Create a tensor representing row indices (i) and unsqueeze for broadcasting
+    #    i_indices will be [0, 1, 2, ..., seq_len-1] and reshaped to [seq_len, 1]
+    i_indices = torch.arange(seq_len, device=device).unsqueeze(1) # Shape: [seq_len, 1]
+    
+    # 2. Create a tensor representing column indices (j) and unsqueeze for broadcasting
+    #    j_indices will be [0, 1, 2, ..., seq_len-1] and reshaped to [1, seq_len]
+    j_indices = torch.arange(seq_len, device=device).unsqueeze(0) # Shape: [1, seq_len]
+    
+    # 3. Calculate the frame index for each row (i_frame = i // n_hw)
+    #    This operation is performed element-wise on i_indices
+    i_frame = i_indices // n_hw # Shape: [seq_len, 1]
+    
+    # 4. Calculate the upper bound for filling with 0 for each row: (i_frame + 1) * n_hw
+    #    This is the threshold where elements in j_indices should be less than to be set to 0
+    upper_bounds = (i_frame + 1) * n_hw # Shape: [seq_len, 1]
+    
+    # 5. Create a boolean condition mask using broadcasting
+    #    This compares every j_index with its corresponding upper_bound.
+    #    The result is a [seq_len, seq_len] boolean tensor.
+    condition = j_indices < upper_bounds # Shape: [seq_len, seq_len]
+    
+    # 6. Use torch.where to construct the final mask
+    #    Where `condition` is True, set the value to 0.0.
+    #    Where `condition` is False, set the value to float("-inf").
+    mask = torch.where(condition, 0.0, float("-inf")).to(dtype)
+
+    if batch_size is not None:
+        mask = mask.unsqueeze(0).expand(batch_size, -1, -1)
+        
+    return mask
 
 def prepare_causal_attention_mask(n_frame: int, n_hw: int, dtype, device, batch_size: int = None):
     seq_len = n_frame * n_hw
@@ -153,7 +189,9 @@ class UpsampleCausal3D(nn.Module):
         # size and do not make use of `scale_factor=2`
         if self.interpolate:
             B, C, T, H, W = hidden_states.shape
-            first_h, other_h = hidden_states.split((1, T - 1), dim=2)
+            #first_h, other_h = hidden_states.split((1, T - 1), dim=2)
+            first_h = hidden_states[:, :, :1, :, :]
+            other_h = hidden_states[:, :, 1:, :, :]
             if output_size is None:
                 if T > 1:
                     other_h = F.interpolate(other_h, scale_factor=self.upsample_factor, mode="nearest")
@@ -618,10 +656,16 @@ class UNetMidBlockCausal3D(nn.Module):
             if attn is not None:
                 B, C, T, H, W = hidden_states.shape
                 hidden_states = rearrange(hidden_states, "b c f h w -> b (f h w) c")
-                attention_mask = prepare_causal_attention_mask(
+                attention_mask_0 = prepare_causal_attention_mask_vectorized(
                     T, H * W, hidden_states.dtype, hidden_states.device, batch_size=B
                 )
-                hidden_states = attn(hidden_states, temb=temb, attention_mask=attention_mask)
+                #attention_mask_1 = prepare_causal_attention_mask(
+                #    T, H * W, hidden_states.dtype, hidden_states.device, batch_size=B
+                #)
+                #elementwise_equality = torch.eq(attention_mask_0, attention_mask_1)
+                #print(f"Element-wise equality (torch.eq(attention_mask_0, attention_mask_1)):\n{elementwise_equality}")
+                #print("(Returns a boolean tensor indicating equality at each position)\n")
+                hidden_states = attn(hidden_states, temb=temb, attention_mask=attention_mask_0)
                 hidden_states = rearrange(hidden_states, "b (f h w) c -> b c f h w", f=T, h=H, w=W)
             hidden_states = resnet(hidden_states, temb)
 
