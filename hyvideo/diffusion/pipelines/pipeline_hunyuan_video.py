@@ -836,6 +836,10 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             batch_size = prompt_embeds.shape[0]
 
         device = torch.device(f"cuda:{dist.get_rank()}") if dist.is_initialized() else self._execution_device
+        
+        torch.cuda.cudart().cudaProfilerStart()
+
+        torch.cuda.nvtx.range_push("encode input prompt")
 
         # 3. Encode input prompt
         lora_scale = (
@@ -890,6 +894,8 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             prompt_mask_2 = None
             negative_prompt_mask_2 = None
 
+        torch.cuda.nvtx.range_pop()
+        
         # For classifier free guidance, we need to do two forward passes.
         # Here we concatenate the unconditional and text embeddings into a single batch
         # to avoid doing two forward passes
@@ -923,6 +929,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         else:
             video_length = video_length
 
+        torch.cuda.nvtx.range_push("prepare latent variables")
         # 5. Prepare latent variables
         num_channels_latents = self.transformer.config.in_channels
         latents = self.prepare_latents(
@@ -936,7 +943,8 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             generator,
             latents,
         )
-
+        torch.cuda.nvtx.range_pop()
+        
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_func_kwargs(
             self.scheduler.step,
@@ -959,6 +967,9 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         # if is_progress_bar:
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
+                
+                if i >= num_warmup_steps: torch.cuda.nvtx.range_push("denoising_loop{}".format(i))
+                
                 if self.interrupt:
                     continue
 
@@ -984,6 +995,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                     else None
                 )
 
+                if i >= num_warmup_steps: torch.cuda.nvtx.range_push("predit the noise residual")
                 # predict the noise residual
                 with torch.autocast(
                     device_type="cuda", dtype=target_dtype, enabled=autocast_enabled
@@ -1001,6 +1013,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                     )[
                         "x"
                     ]
+                if i >= num_warmup_steps: torch.cuda.nvtx.range_pop()
 
                 # perform guidance
                 if self.do_classifier_free_guidance:
@@ -1017,11 +1030,14 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                         guidance_rescale=self.guidance_rescale,
                     )
 
+                if i >= num_warmup_steps: torch.cuda.nvtx.range_push("compute the previous noisy sample")
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(
                     noise_pred, t, latents, **extra_step_kwargs, return_dict=False
                 )[0]
 
+                if i >= num_warmup_steps: torch.cuda.nvtx.range_pop()
+                
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
                     for k in callback_on_step_end_tensor_inputs:
@@ -1033,7 +1049,8 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                     negative_prompt_embeds = callback_outputs.pop(
                         "negative_prompt_embeds", negative_prompt_embeds
                     )
-
+                if i >= num_warmup_steps: torch.cuda.nvtx.range_pop()
+                
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or (
                     (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
@@ -1043,7 +1060,10 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                     if callback is not None and i % callback_steps == 0:
                         step_idx = i // getattr(self.scheduler, "order", 1)
                         callback(step_idx, t, latents)
-
+                        
+        #torch.cuda.cudart().cudaProfilerStop()
+        torch.cuda.nvtx.range_push("vae decode")
+        
         if not output_type == "latent":
             expand_temporal_dim = False
             if len(latents.shape) == 4:
@@ -1087,6 +1107,9 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         else:
             image = latents
 
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.cudart().cudaProfilerStop()
+        
         image = (image / 2 + 0.5).clamp(0, 1)
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
         image = image.cpu().float()
