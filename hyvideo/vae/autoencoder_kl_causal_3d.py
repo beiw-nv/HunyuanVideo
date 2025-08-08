@@ -18,9 +18,12 @@
 # ==============================================================================
 from typing import Dict, Optional, Tuple, Union
 from dataclasses import dataclass
+from cuda import cudart
 
 import torch
 import torch.nn as nn
+import tensorrt as trt
+import os
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 
@@ -43,6 +46,8 @@ from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from diffusers.models.modeling_utils import ModelMixin
 from .vae import DecoderCausal3D, BaseOutput, DecoderOutput, DiagonalGaussianDistribution, EncoderCausal3D
 
+
+TRT_LOGGER = trt.Logger(trt.Logger.ERROR)
 
 @dataclass
 class DecoderOutput2(BaseOutput):
@@ -131,6 +136,72 @@ class AutoencoderKLCausal3D(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
         self.tile_latent_min_size = int(sample_size / (2 ** (len(self.config.block_out_channels) - 1)))
         self.tile_overlap_factor = 0.25
 
+        #trt variables 
+        self.engine = {}
+        self.events = {}
+        self.shape_dicts = {}
+        #self.feed_dicts = {}
+        self.enable_trt = False
+        self.stream = None
+        self.shared_device_memory = None
+        self.use_cuda_graph = False
+        self.max_shared_device_memory_size = 0
+
+    # trt functions 
+    def loadResources(self, device):
+        for model_name, engine in self.engine.items():
+            self.events[model_name] = [cudart.cudaEventCreate()[1], cudart.cudaEventCreate()[1]]
+            self.max_shared_device_memory_size = max(self.max_shared_device_memory_size, engine.engine.device_memory_size)
+            #engine.allocate_buffers(shape_dict=self.shape_dicts[model_name], device=device)
+            
+        self.stream = cudart.cudaStreamCreate()[1]
+
+        ## Allocate shared device memory for TensorRT engines
+        self.shared_device_memory = cudart.cudaMalloc(self.max_shared_device_memory_size)[1]
+        ## Activate TensorRT engines
+        for model_name, engine in self.engine.items():
+            engine.activate(device_memory=self.shared_device_memory)
+            engine.allocate_buffers(shape_dict=self.shape_dicts[model_name], device=device)
+                
+    def tearDown(self):
+        for e in self.events.values():
+            cudart.cudaEventDestroy(e[0])
+            cudart.cudaEventDestroy(e[1])
+        
+        for engine in self.engine.values():
+            engine.deactivate()
+            engine.deallocate_buffers()
+            del engine
+            
+        if self.shared_device_memory:
+            cudart.cudaFree(self.shared_device_memory)
+                
+        cudart.cudaStreamDestroy(self.stream)
+        del self.stream
+        
+    def activateEngines(self, model_name, alloc_shape=None):
+        if not self.engine[model_name].context:
+            assert not self.use_cuda_graph
+            self.engine[model_name].activate(device_memory=self.shared_device_memory)
+
+        if alloc_shape and not self.engine[model_name].tensors:
+            assert not self.use_cuda_graph
+            self.engine[model_name].allocate_buffers(shape_dict=alloc_shape, device=self.device)
+            
+    def deactivateEngines(self, model_name, release_model=True):
+        if not release_model:
+            return
+     
+        assert not self.use_cuda_graph
+        self.engine[model_name].deallocate_buffers()
+        self.engine[model_name].deactivate()
+                
+    def runEngine(self, model_name, x: torch.FloatTensor):
+        engine = self.engine[model_name]
+        feed_dict = {"latent_sample": x}
+        return engine.infer(feed_dict, self.stream, use_cuda_graph=self.use_cuda_graph)
+    # trt function end
+    
     def _set_gradient_checkpointing(self, module, value=False):
         if isinstance(module, (EncoderCausal3D, DecoderCausal3D)):
             module.gradient_checkpointing = value
@@ -280,7 +351,7 @@ class AutoencoderKLCausal3D(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
         if self.use_spatial_tiling and (x.shape[-1] > self.tile_sample_min_size or x.shape[-2] > self.tile_sample_min_size):
             return self.spatial_tiled_encode(x, return_dict=return_dict)
 
-        if self.use_slicing and x.shape[0] > 1:
+        if self.use_slicing and x.shape[0]> 1:
             encoded_slices = [self.encoder(x_slice) for x_slice in x.split(1)]
             h = torch.cat(encoded_slices)
         else:
@@ -304,7 +375,18 @@ class AutoencoderKLCausal3D(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
             return self.spatial_tiled_decode(z, return_dict=return_dict)
 
         z = self.post_quant_conv(z)
-        dec = self.decoder(z)
+        if self.enable_trt:
+            alloc_shape = {"latent_sample": (z.shape[0], z.shape[1], z.shape[2], z.shape[3], z.shape[4]),
+                           "sample": (z.shape[0], self.config.out_channels, (z.shape[2] - 1) * self.config.time_compression_ratio + 1, z.shape[3] * self.config.spatial_compression_ratio, z.shape[4] * self.config.spatial_compression_ratio)
+                           }
+            with trt.Runtime(TRT_LOGGER), torch.cuda.device(z.device.index):
+                if self.shape_dicts['decoder'] != alloc_shape:
+                    self.deactivateEngines('decoder', release_model=True)
+                    self.activateEngines('decoder', alloc_shape=alloc_shape)
+                    self.shape_dicts['decoder'] = alloc_shape
+                dec = self.runEngine('decoder', z)['sample']
+        else:
+            dec = self.decoder(z)
 
         if not return_dict:
             return (dec,)
@@ -440,7 +522,19 @@ class AutoencoderKLCausal3D(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
             for j in range(0, z.shape[-1], overlap_size):
                 tile = z[:, :, :, i: i + self.tile_latent_min_size, j: j + self.tile_latent_min_size]
                 tile = self.post_quant_conv(tile)
-                decoded = self.decoder(tile)
+                if self.enable_trt:
+                    alloc_shape = {"latent_sample": (tile.shape[0], tile.shape[1], tile.shape[2], tile.shape[3], tile.shape[4]),
+                                   "sample": (tile.shape[0], self.config.out_channels, (tile.shape[2] - 1) * self.config.time_compression_ratio + 1, tile.shape[3] * self.config.spatial_compression_ratio, tile.shape[4] * self.config.spatial_compression_ratio)
+                                   }
+                    with trt.Runtime(TRT_LOGGER), torch.cuda.device(tile.device.index):
+                        if self.shape_dicts['decoder'] != alloc_shape:
+                            self.deactivateEngines('decoder', release_model=True)
+                            self.activateEngines('decoder', alloc_shape=alloc_shape)
+                            self.shape_dicts['decoder'] = alloc_shape
+                        decoded = self.runEngine('decoder', tile)['sample']
+                else:
+                    decoded = self.decoder(tile)
+                #print(f"rank{os.environ['LOCAL_RANK']} {i=} {j=} {self.tile_latent_min_size=} {tile.shape=} {decoded.shape=}")
                 row.append(decoded)
             rows.append(row)
         result_rows = []
@@ -512,7 +606,18 @@ class AutoencoderKLCausal3D(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
                 decoded = self.spatial_tiled_decode(tile, return_dict=True).sample
             else:
                 tile = self.post_quant_conv(tile)
-                decoded = self.decoder(tile)
+                if self.enable_trt:
+                    alloc_shape = {"latent_sample": (tile.shape[0], tile.shape[1], tile.shape[2], tile.shape[3], tile.shape[4]),
+                                   "sample": (tile.shape[0], self.config.out_channels, (tile.shape[2] - 1) * self.config.time_compression_ratio + 1, tile.shape[3] * self.config.spatial_compression_ratio, tile.shape[4] * self.config.spatial_compression_ratio)
+                                   }
+                    with trt.Runtime(TRT_LOGGER),torch.cuda.device(tile.device.index):
+                        if self.shape_dicts['decoder'] != alloc_shape:
+                            self.deactivateEngines('decoder', release_model=True)
+                            self.activateEngines('decoder', alloc_shape=alloc_shape)
+                            self.shape_dicts['decoder'] = alloc_shape
+                        decoded = self.runEngine('decoder', tile)['sample']
+                else:
+                    decoded = self.decoder(tile)
             if i > 0:
                 decoded = decoded[:, :, 1:, :, :]
             row.append(decoded)

@@ -212,8 +212,16 @@ class Inference(object):
         vae, _, s_ratio, t_ratio = load_vae(
             args.vae,
             args.vae_precision,
+            args.batch_size,
+            args.video_size[0],
+            args.video_size[1],
+            args.video_length,
             logger=logger,
             device=device if not args.use_cpu_offload else "cpu",
+            vae_trt=args.vae_trt,
+            onnx_dir=args.onnx_dir,
+            engine_dir=args.engine_dir,
+            enable_tiling=args.vae_tiling,
         )
         vae_kwargs = {"s_ratio": s_ratio, "t_ratio": t_ratio}
 
@@ -671,6 +679,9 @@ class HunyuanVideoSampler(Inference):
         out_dict["samples"] = samples
         out_dict["prompts"] = prompt
 
+        if self.args.vae_trt:
+            self.pipeline.vae.tearDown()
+            
         gen_time = time.time() - start_time
         logger.info(f"Success, time: {gen_time}")
 

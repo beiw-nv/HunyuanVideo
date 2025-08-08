@@ -78,6 +78,32 @@ def add_extra_models_args(parser: argparse.ArgumentParser):
     )
     group.set_defaults(vae_tiling=True)
 
+    parser.add_argument(
+        "--onnx-opset",
+        type=int,
+        default=19,
+        choices=range(7, 20),
+        help="Select ONNX opset version to target for exported models",
+    )
+    parser.add_argument(
+        "--onnx-dir",
+        type=str,
+        default="onnx",
+        help="Output directory for ONNX export"
+    )
+    group.add_argument(
+        "--engine_dir",
+        type=str,
+        default="engine",
+        help="VAE decode trt engine path",
+    )
+    group.add_argument(
+        "--vae_trt",
+        action="store_true",
+        help="Enable TRT for VAE decoder",
+    )
+    group.set_defaults(vae_trt=False)
+    # - TEXT 
     group.add_argument(
         "--text-encoder",
         type=str,
