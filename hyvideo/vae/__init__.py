@@ -83,8 +83,6 @@ def load_vae(vae_type: str="884-16c-hy",
             dummy_shape = (batch_size, vae.config.latent_channels, int(vae.tile_sample_min_tsize // time_compression_ratio + 1), vae.tile_latent_min_size, vae.tile_latent_min_size)
         else:
             dummy_shape = (batch_size, vae.config.latent_channels, int( (video_length - 1) // time_compression_ratio + 1), int( height // spatial_compression_ratio), int( width // spatial_compression_ratio))
-        print(f"trt {dummy_shape=}")
-        #dummy_input = torch.randn(1, vae.config.latent_channels, 17, 32, 32, device=device, dtype=torch.float32)
         dummy_input = torch.randn(dummy_shape, device=device, dtype=torch.float32)
         # Create directories if missing
         for directory in [engine_dir, onnx_dir]:
@@ -105,10 +103,9 @@ def load_vae(vae_type: str="884-16c-hy",
                                   dummy_input,
                                   f=onnx_file,
                                   opset_version=23,
-                                  input_names=["latent_sample"],
-                                  output_names=["sample"],
-                                  dynamic_axes={ "latent_sample": {2: "video_length_tile", 3: "height_tile", 4: "width_tile"},
-                                                 "sample":  {2: "video_length_tile", 3: "height_tile", 4: "width_tile"}
+                                  input_names=["sample"],
+                                  output_names=["sample_output"],
+                                  dynamic_shapes={ "sample": {2: "video_length_tile", 3: "height_tile", 4: "width_tile"},
                                                 },
                                   verbose=False,
                                   dynamo=True,
@@ -122,7 +119,7 @@ def load_vae(vae_type: str="884-16c-hy",
         if enable_tiling:
             engine_file = os.path.join(engine_dir, f'vae_decoder_tiled_rank{os.environ['LOCAL_RANK']}.trt'+trt.__version__+'.plan')
         else:
-            engine_file = os.path.join(engine_dir, 'vae_decoder.trt'+trt.__version__+'.plan')
+            engine_file = os.path.join(engine_dir, f'vae_decoder_rank{os.environ['LOCAL_RANK']}.trt'+trt.__version__+'.plan')
         vae_engine = Engine(engine_file)
         
         opt_shape =  dummy_shape
@@ -148,7 +145,7 @@ def load_vae(vae_type: str="884-16c-hy",
                                  tf32=False,
                                  int8=False,
                                  input_profile={
-                                     "latent_sample": [
+                                     "sample": [
                                          min_shape,
                                          opt_shape,
                                          max_shape,
@@ -166,8 +163,8 @@ def load_vae(vae_type: str="884-16c-hy",
         vae.engine["decoder"] = vae_engine
         vae.engine["decoder"].load()
 
-        alloc_shape_max = { "latent_sample": max_shape,
-                            "sample": (max_shape[0], vae.config.out_channels, (max_shape[2] - 1) * time_compression_ratio + 1, max_shape[3] * spatial_compression_ratio, max_shape[4] * spatial_compression_ratio)
+        alloc_shape_max = { "sample": max_shape,
+                            "sample_output": (max_shape[0], vae.config.out_channels, (max_shape[2] - 1) * time_compression_ratio + 1, max_shape[3] * spatial_compression_ratio, max_shape[4] * spatial_compression_ratio)
                            }
         vae.shape_dicts['decoder'] = alloc_shape_max
                 
