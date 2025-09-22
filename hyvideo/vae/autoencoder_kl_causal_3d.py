@@ -179,14 +179,14 @@ class AutoencoderKLCausal3D(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
         cudart.cudaStreamDestroy(self.stream)
         del self.stream
         
-    def activateEngines(self, model_name, alloc_shape=None):
+    def activateEngines(self, model_name, device, alloc_shape=None):
         if not self.engine[model_name].context:
             assert not self.use_cuda_graph
             self.engine[model_name].activate(device_memory=self.shared_device_memory)
 
         if alloc_shape and not self.engine[model_name].tensors:
             assert not self.use_cuda_graph
-            self.engine[model_name].allocate_buffers(shape_dict=alloc_shape, device=self.device)
+            self.engine[model_name].allocate_buffers(shape_dict=alloc_shape, device=device)
             
     def deactivateEngines(self, model_name, release_model=True):
         if not release_model:
@@ -382,7 +382,7 @@ class AutoencoderKLCausal3D(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
             with trt.Runtime(TRT_LOGGER), torch.cuda.device(z.device.index):
                 if self.shape_dicts['decoder'] != alloc_shape:
                     self.deactivateEngines('decoder', release_model=True)
-                    self.activateEngines('decoder', alloc_shape=alloc_shape)
+                    self.activateEngines('decoder', z.device, alloc_shape=alloc_shape)
                     self.shape_dicts['decoder'] = alloc_shape
                 dec = self.runEngine('decoder', z)['sample_output']
         else:
@@ -529,7 +529,7 @@ class AutoencoderKLCausal3D(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
                     with trt.Runtime(TRT_LOGGER), torch.cuda.device(tile.device.index):
                         if self.shape_dicts['decoder'] != alloc_shape:
                             self.deactivateEngines('decoder', release_model=True)
-                            self.activateEngines('decoder', alloc_shape=alloc_shape)
+                            self.activateEngines('decoder', tile.device, alloc_shape=alloc_shape)
                             self.shape_dicts['decoder'] = alloc_shape
                         decoded = self.runEngine('decoder', tile)['sample_output']
                 else:
@@ -613,7 +613,7 @@ class AutoencoderKLCausal3D(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
                     with trt.Runtime(TRT_LOGGER),torch.cuda.device(tile.device.index):
                         if self.shape_dicts['decoder'] != alloc_shape:
                             self.deactivateEngines('decoder', release_model=True)
-                            self.activateEngines('decoder', alloc_shape=alloc_shape)
+                            self.activateEngines('decoder', tile.device, alloc_shape=alloc_shape)
                             self.shape_dicts['decoder'] = alloc_shape
                         decoded = self.runEngine('decoder', tile)['sample_output']
                 else:

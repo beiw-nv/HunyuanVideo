@@ -5,6 +5,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import tensorrt as trt
+import os
+from cuda import cudart
+
 from diffusers.models import ModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 
@@ -464,7 +468,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         qk_norm_type: str = "rms",
         guidance_embed: bool = False,  # For modulation.
         text_projection: str = "single_refiner",
-        use_attention_mask: bool = True,
+        use_attention_mask: bool = True, # TRT engine convert has error in setting to True, FIX IT!
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
     ):
@@ -580,6 +584,238 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             **factory_kwargs,
         )
 
+        # trt variables
+        self.enable_trt = False
+              
+        self.engine = {}
+        self.events = {}
+        self.shape_dicts = {}
+        #self.feed_dicts = {}
+        self.enable_trt = False
+        self.stream = None
+        self.shared_device_memory = None
+        self.use_cuda_graph = False
+        self.max_shared_device_memory_size = 0
+        
+    # trt functions
+    def loadResources(self, device):
+        for model_name, engine in self.engine.items():
+            self.events[model_name] = [cudart.cudaEventCreate()[1], cudart.cudaEventCreate()[1]]
+            self.max_shared_device_memory_size = max(self.max_shared_device_memory_size, engine.engine.device_memory_size)
+                        
+            self.stream = cudart.cudaStreamCreate()[1]
+            
+            ## Allocate shared device memory for TensorRT engines
+            self.shared_device_memory = cudart.cudaMalloc(self.max_shared_device_memory_size)[1]
+            ## Activate TensorRT engines
+            for model_name, engine in self.engine.items():
+                engine.activate(device_memory=self.shared_device_memory)
+                engine.allocate_buffers(shape_dict=self.shape_dicts[model_name], device=device)
+                
+    def tearDown(self):
+        for e in self.events.values():
+            cudart.cudaEventDestroy(e[0])
+            cudart.cudaEventDestroy(e[1])
+            
+        for engine in self.engine.values():
+            engine.deactivate()
+            engine.deallocate_buffers()
+            del engine
+            
+        if self.shared_device_memory:
+            cudart.cudaFree(self.shared_device_memory)
+        
+        cudart.cudaStreamDestroy(self.stream)
+        del self.stream
+
+    def activateEngines(self, model_name, device, alloc_shape=None):
+        if not self.engine[model_name].context:
+            assert not self.use_cuda_graph
+            self.engine[model_name].activate(device_memory=self.shared_device_memory)
+        
+        if alloc_shape and not self.engine[model_name].tensors:
+            assert not self.use_cuda_graph
+            self.engine[model_name].allocate_buffers(shape_dict=alloc_shape, device=device)
+            
+    def deactivateEngines(self, model_name, release_model=True):
+        if not release_model:
+            return
+        
+        assert not self.use_cuda_graph
+        self.engine[model_name].deallocate_buffers()
+        self.engine[model_name].deactivate()
+
+    def runEngine(self,
+                  model_name,
+                  x: torch.Tensor,
+                  t: torch.Tensor,  # Should be in range(0, 1000).
+                  text_states: torch.Tensor = None,
+                  text_mask: torch.LongTensor = None,  # Now we don't use it.
+                  text_states_2: Optional[torch.Tensor] = None,  # Text embedding for modulation.
+                  freqs_cos: Optional[torch.Tensor] = None,
+                  freqs_sin: Optional[torch.Tensor] = None,
+                  guidance: torch.Tensor = None,  # Guidance for modulation, should be cfg_scale x 1000.
+                  return_dict: bool = True) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+        engine = self.engine[model_name]
+        feed_dict = {"x": x,
+                     "t": t,
+                     "text_states": text_states,
+                     "text_states_2": text_states_2,
+                     "freqs_cos": freqs_cos,
+                     "freqs_sin": freqs_sin,
+                     "guidance": guidance,
+                     }
+        if self.use_attention_mask:
+            feed_dict["text_mask"] = text_mask
+        
+        return engine.infer(feed_dict, self.stream, use_cuda_graph=self.use_cuda_graph)
+
+    def get_input_names(self):
+        if self.use_attention_mask:
+            return ['x', 't', 'text_states', 'text_mask', 'text_states_2', 'freqs_cos', 'freqs_sin', 'guidance', 'return_dict']
+        else:
+            return ['x', 't', 'text_states', 'text_states_2', 'freqs_cos', 'freqs_sin', 'guidance', 'return_dict']
+        
+    def get_output_names(self, return_dict: bool = True):
+        if return_dict:
+            return ['out.x']
+        else:
+            return ['img']
+
+    def get_dynamic_axes(self, return_dict: bool = True):
+        if return_dict:
+            return { "x": {2: "video_length", 3: "height", 4: "width"},
+                     "out.x": {2: "video_length", 3: "height", 4: "width"}
+                    }
+        else:
+            return { "x": {2: "video_length", 3: "height", 4: "width"},
+                     "img": {2: "video_length", 3: "height", 4: "width"}
+                    }
+        
+    def get_input_profile(self, batch_size, latent_video_length, latent_height, latent_width, static: bool = True):
+        if static:
+            latent_channels = self.in_channels
+            min_batch_size = batch_size
+            max_batch_size = batch_size
+            min_latent_video_length = latent_video_length
+            max_latent_video_length = latent_video_length
+            min_latent_height = latent_height
+            max_latent_height = latent_height
+            min_latent_width = latent_width
+            max_latent_width = latent_width
+            img_seq_len= (latent_video_length // self.patch_size[0])* (latent_height // self.patch_size[1]) * (latent_width // self.patch_size[2])
+            min_img_seq_len= (min_latent_video_length // self.patch_size[0])* (min_latent_height // self.patch_size[1]) * (min_latent_width // self.patch_size[2])
+            max_img_seq_len= (max_latent_video_length // self.patch_size[0])* (max_latent_height // self.patch_size[1]) * (max_latent_width // self.patch_size[2])
+              
+            input_profile = {
+                "x": [
+                    (min_batch_size, latent_channels, min_latent_video_length, min_latent_height, min_latent_width),
+                    (batch_size, latent_channels, latent_video_length, latent_height, latent_width),
+                    (max_batch_size, latent_channels, max_latent_video_length, max_latent_height, max_latent_width),
+                    ],
+                "t": [(min_batch_size,), (batch_size,),(max_batch_size,)],
+                "text_states": [
+                    (min_batch_size, 256, 4096),
+                    (batch_size, 256, 4096),
+                    (max_batch_size, 256, 4096),
+                ],
+                "text_states_2": [
+                    (min_batch_size, 768),
+                    (batch_size, 768),
+                    (max_batch_size, 768),
+                ],
+                "freqs_cos": [
+                    (min_img_seq_len, 128),
+                    (img_seq_len, 128),
+                    (max_img_seq_len, 128),
+                ],
+                "freqs_sin": [
+                    (min_img_seq_len, 128),
+                    (img_seq_len, 128),
+                    (max_img_seq_len, 128),
+                ],
+                "guidance": [(min_batch_size,),(batch_size,),(max_batch_size,)],
+            }
+            if self.use_attention_mask:
+                input_profile["text_mask"] = [(min_batch_size, 256),(batch_size, 256),(max_batch_size, 256)]
+        else:
+            raise NotImplementedError(f"[E] non-static input profile for model engine has not been implenmented")
+                        
+        return input_profile
+            
+    def get_sample_input(self, batch_size, latent_video_length, latent_height, latent_width, device, return_dict: bool = True):
+        latent_channels = self.in_channels
+        img_seq_len= (latent_video_length // self.patch_size[0])* (latent_height // self.patch_size[1]) * (latent_width // self.patch_size[2])
+                
+        latent_shape = [batch_size, latent_channels, latent_video_length, latent_height, latent_width]
+        prompt_embeds_shape = [batch_size, 256, 4096]
+        prompt_embeds2_shape = [batch_size, 768]
+        prompt_mask_shape = [batch_size, 256]
+        freqs_shape = [img_seq_len, 128]
+        
+        dummy_latent_input = torch.randn(latent_shape, device=device, dtype=torch.float32)
+        dummy_prompt_embeds = torch.randn(prompt_embeds_shape, device=device, dtype=torch.float16)
+        dummy_prompt_embeds2 = torch.randn(prompt_embeds2_shape, device=device, dtype=torch.float16)
+        dummy_prompt_mask = torch.ones(prompt_mask_shape, device=device, dtype=torch.long)
+        dummy_freqs_cis0 = torch.randn(freqs_shape, device=device, dtype=torch.float32)
+        dummy_freqs_cis1 = torch.randn(freqs_shape, device=device, dtype=torch.float32)
+        dummy_guidance_expand = torch.randn(batch_size, device=device, dtype=torch.bfloat16)
+        dummy_t_expand = torch.randn(batch_size, device=device, dtype=torch.float32)
+
+        if self.use_attention_mask:
+            sample_input = (dummy_latent_input,
+                            dummy_t_expand,
+                            dummy_prompt_embeds,
+                            dummy_prompt_mask,
+                            dummy_prompt_embeds2,
+                            dummy_freqs_cis0,
+                            dummy_freqs_cis1,
+                            dummy_guidance_expand,
+                            return_dict)
+        else:
+            sample_input = (dummy_latent_input,
+                            dummy_t_expand,
+                            dummy_prompt_embeds,
+                            dummy_prompt_embeds2,
+                            dummy_freqs_cis0,
+                            dummy_freqs_cis1,
+                            dummy_guidance_expand,
+                            return_dict)
+            
+        return sample_input
+    
+    def get_shape_dict(self, batch_size, latent_video_length, latent_height, latent_width, return_dict: bool = True):
+        latent_channels = self.in_channels
+        img_seq_len= (latent_video_length // self.patch_size[0])* (latent_height // self.patch_size[1]) * (latent_width // self.patch_size[2])
+
+        latent_shape = (batch_size, latent_channels, latent_video_length, latent_height, latent_width)
+        prompt_embeds_shape = (batch_size, 256, 4096)
+        prompt_embeds2_shape = (batch_size, 768)
+        prompt_mask_shape = (batch_size, 256)
+        freqs_shape = (img_seq_len, 128)
+
+        shape_dict = {
+            "x": latent_shape,
+            "t": (batch_size,),
+            "text_states": prompt_embeds_shape,
+            "text_states_2": prompt_embeds2_shape,
+            "freqs_cos": freqs_shape,
+            "freqs_sin": freqs_shape,
+            "guidance": (batch_size,),
+            "return_dict": (1,),
+        }
+        
+        if self.use_attention_mask:
+            shape_dict["text_mask"] = prompt_mask_shape
+
+        if return_dict:
+            shape_dict['out.x'] = latent_shape
+        else:
+            shape_dict['img'] = latent_shape
+            
+        return shape_dict
+        
+    # trt function end
     def enable_deterministic(self):
         for block in self.double_blocks:
             block.enable_deterministic()
@@ -597,7 +833,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         x: torch.Tensor,
         t: torch.Tensor,  # Should be in range(0, 1000).
         text_states: torch.Tensor = None,
-        text_mask: torch.Tensor = None,  # Now we don't use it.
+        text_mask: torch.LongTensor = None,  # Now we don't use it.
         text_states_2: Optional[torch.Tensor] = None,  # Text embedding for modulation.
         freqs_cos: Optional[torch.Tensor] = None,
         freqs_sin: Optional[torch.Tensor] = None,

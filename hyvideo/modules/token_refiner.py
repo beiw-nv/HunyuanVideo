@@ -152,7 +152,9 @@ class IndividualTokenRefiner(nn.Module):
             # batch_size x 1 x seq_len x seq_len
             self_attn_mask_2 = self_attn_mask_1.transpose(2, 3)
             # batch_size x 1 x seq_len x seq_len, 1 for broadcasting of heads_num
-            self_attn_mask = (self_attn_mask_1 & self_attn_mask_2).bool()
+            #self_attn_mask = (self_attn_mask_1 & self_attn_mask_2).bool()
+            # trt engine build does not support bitwiseAnd operation 
+            self_attn_mask = torch.logical_and(self_attn_mask_1, self_attn_mask_2)
             # avoids self-attention weight being NaN for padding tokens
             self_attn_mask[:, :, :, 0] = True
 

@@ -23,6 +23,7 @@ import torch.distributed as dist
 import numpy as np
 from dataclasses import dataclass
 from packaging import version
+import tensorrt as trt
 
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.configuration_utils import FrozenDict
@@ -52,6 +53,8 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 EXAMPLE_DOC_STRING = """"""
 
+
+TRT_LOGGER = trt.Logger(trt.Logger.ERROR)
 
 def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
     """
@@ -921,7 +924,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             sigmas,
             **extra_set_timesteps_kwargs,
         )
-
+        
         if "884" in vae_ver:
             video_length = (video_length - 1) // 4 + 1
         elif "888" in vae_ver:
@@ -1000,19 +1003,37 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                 with torch.autocast(
                     device_type="cuda", dtype=target_dtype, enabled=autocast_enabled
                 ):
-                    noise_pred = self.transformer(  # For an input image (129, 192, 336) (1, 256, 256)
-                        latent_model_input,  # [2, 16, 33, 24, 42]
-                        t_expand,  # [2]
-                        text_states=prompt_embeds,  # [2, 256, 4096]
-                        text_mask=prompt_mask,  # [2, 256]
-                        text_states_2=prompt_embeds_2,  # [2, 768]
-                        freqs_cos=freqs_cis[0],  # [seqlen, head_dim]
-                        freqs_sin=freqs_cis[1],  # [seqlen, head_dim]
-                        guidance=guidance_expand,
-                        return_dict=True,
-                    )[
-                        "x"
-                    ]
+                    #print(f"{latent_model_input.shape=} {latent_model_input.dtype=} {t_expand=} {prompt_embeds.shape=} {prompt_embeds.dtype=} {prompt_embeds_2.shape=} {prompt_embeds_2.dtype=} {prompt_mask.shape=} {prompt_mask.dtype=} {prompt_mask.dtype=} {freqs_cis[0].shape=} {freqs_cis[0].dtype=} {guidance_expand=}")
+                    if self.transformer.enable_trt:
+                        with trt.Runtime(TRT_LOGGER), torch.cuda.device(latent_model_input.device.index):
+                            noise_pred = self.transformer.runEngine("transformer",
+                                                                    latent_model_input,  # [2, 16, 33, 24, 42]
+                                                                    t_expand,  # [2]
+                                                                    text_states=prompt_embeds,  # [2, 256, 4096]
+                                                                    text_mask=prompt_mask,  # [2, 256]
+                                                                    text_states_2=prompt_embeds_2,  # [2, 768]
+                                                                    freqs_cos=freqs_cis[0],  # [seqlen, head_dim]
+                                                                    freqs_sin=freqs_cis[1],  # [seqlen, head_dim]
+                                                                    guidance=guidance_expand,
+                                                                    return_dict=True,
+                                                                    )[
+                                                                        "x"
+                                                                    ]
+                    else:
+                        noise_pred = self.transformer(  # For an input image (129, 192, 336) (1, 256, 256)
+                            latent_model_input,  # [2, 16, 33, 24, 42]
+                            t_expand,  # [2]
+                            text_states=prompt_embeds,  # [2, 256, 4096]
+                            text_mask=prompt_mask,  # [2, 256]
+                            text_states_2=prompt_embeds_2,  # [2, 768]
+                            freqs_cos=freqs_cis[0],  # [seqlen, head_dim]
+                            freqs_sin=freqs_cis[1],  # [seqlen, head_dim]
+                            guidance=guidance_expand,
+                            return_dict=True,
+                        )[
+                            "x"
+                        ]
+                   
                 if i >= num_warmup_steps: torch.cuda.nvtx.range_pop()
 
                 # perform guidance

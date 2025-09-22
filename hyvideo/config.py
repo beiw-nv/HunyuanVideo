@@ -44,6 +44,13 @@ def add_network_args(parser: argparse.ArgumentParser):
         help="Precision mode. Options: fp32, fp16, bf16. Applied to the backbone model and optimizer.",
     )
 
+    group.add_argument(
+        "--model_trt",
+        action="store_true",
+        help="Enable TRT for transformer backbone",
+    )
+    group.set_defaults(model_trt=False)
+    
     # RoPE
     group.add_argument(
         "--rope-theta", type=int, default=256, help="Theta used in RoPE."
@@ -349,7 +356,7 @@ def add_inference_args(parser: argparse.ArgumentParser):
     group.add_argument(
         "--seed-type",
         type=str,
-        default="auto",
+        default="fixed",
         choices=["file", "random", "fixed", "auto"],
         help="Seed type for evaluation. If file, use the seed from the CSV file. If random, generate a "
         "random seed. If fixed, use the fixed seed given by `--seed`. If auto, `csv` will use the "

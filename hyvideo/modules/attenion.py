@@ -4,12 +4,9 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 import os
-#os.environ["NVTE_FUSED_ATTN"] = "1"
-#os.environ["NVTE_FUSED_ATTN_BACKEND"] = "1"
-#os.environ["NVTE_FLASH_ATTN"] = "0"
-#os.environ["NVTE_FUSED_ATTN_USE_FAv2_BWD"] = "0"
 
 from transformer_engine.pytorch import attention as te
 
@@ -32,7 +29,7 @@ MEMORY_LAYOUT = {
         lambda x: x.transpose(1, 2),
         lambda x: x.transpose(1, 2),
     ),
-    "cudnn": (
+    "te": (
         lambda x: x,
         lambda x: x,
     ),
@@ -47,7 +44,7 @@ def get_cu_seqlens(text_mask, img_len):
     """Calculate cu_seqlens_q, cu_seqlens_kv using text_mask and img_len
 
     Args:
-        text_mask (torch.Tensor): the mask of text
+        text_mask (torch.LongTensor): the mask of text
         img_len (int): the length of image
 
     Returns:
@@ -70,18 +67,18 @@ def get_cu_seqlens(text_mask, img_len):
 
 
 def attention(
-    q,
-    k,
-    v,
-    mode="cudnn",
-    drop_rate=0,
-    attn_mask=None,
-    causal=False,
-    cu_seqlens_q=None,
-    cu_seqlens_kv=None,
-    max_seqlen_q=None,
-    max_seqlen_kv=None,
-    batch_size=1,
+        q,
+        k,
+        v,
+        mode="torch",
+        drop_rate=0,
+        attn_mask=None,
+        causal=False,
+        cu_seqlens_q=None,
+        cu_seqlens_kv=None,
+        max_seqlen_q=None,
+        max_seqlen_kv=None,
+        batch_size=1,
 ):
     """
     Perform QKV self attention.
@@ -92,7 +89,7 @@ def attention(
         v (torch.Tensor): Value tensor with shape [b, s1, a, d]
         mode (str): Attention mode. Choose from 'self_flash', 'cross_flash', 'torch', and 'vanilla'.
         drop_rate (float): Dropout rate in attention map. (default: 0)
-        attn_mask (torch.Tensor): Attention mask with shape [b, s1] (cross_attn), or [b, a, s, s1] (torch or vanilla).
+        attn_mask (torch.LongTensor): Attention mask with shape [b, s1] (cross_attn), or [b, a, s, s1] (torch or vanilla).
             (default: None)
         causal (bool): Whether to use causal attention. (default: False)
         cu_seqlens_q (torch.Tensor): dtype torch.int32. The cumulative sequence lengths of the sequences in the batch,
@@ -111,11 +108,14 @@ def attention(
     v = pre_attn_layout(v)
 
     if mode == "torch":
+        print("call torch attention")
         if attn_mask is not None and attn_mask.dtype != torch.bool:
             attn_mask = attn_mask.to(q.dtype)
-        x = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, dropout_p=drop_rate, is_causal=causal
-        )
+        
+        with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+            x = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, dropout_p=drop_rate, is_causal=causal
+            )
     elif mode == "flash":
         print("call flash attention 2")
         x = flash_attn_varlen_func(
@@ -131,8 +131,8 @@ def attention(
         x = x.view(
             batch_size, max_seqlen_q, x.shape[-2], x.shape[-1]
         )  # reshape x to [b, s, a, d]
-    elif mode == "cudnn":
-        print("call TE cudnn attention backend")
+    elif mode == "te":
+        print("call TE cudnn attention")
         os.environ["NVTE_FUSED_ATTN"] = "1"
         os.environ["NVTE_FUSED_ATTN_BACKEND"] = "1"
         
@@ -154,9 +154,9 @@ def attention(
                             max_seqlen_q=max_seqlen_q,
                             max_seqlen_kv=max_seqlen_kv,
                             attn_mask_type="padding")
-        #print(f"te cudnn attention output shape {x.shape}")
         
     elif mode == "vanilla":
+        print("call vanilla attention")
         scale_factor = 1 / math.sqrt(q.size(-1))
 
         b, a, s, _ = q.shape
@@ -183,7 +183,7 @@ def attention(
         attn = (q @ k.transpose(-2, -1)) * scale_factor
         attn += attn_bias
         attn = attn.softmax(dim=-1)
-        attn = torch.dropout(attn, p=drop_rate, train=True)
+        attn = torch.dropout(attn, p=drop_rate, train=False)
         x = attn @ v
     else:
         raise NotImplementedError(f"Unsupported attention mode: {mode}")
@@ -197,7 +197,6 @@ def attention(
         
     return out
 
-
 def parallel_attention(
     hybrid_seq_parallel_attn,
     q,
@@ -208,6 +207,7 @@ def parallel_attention(
     cu_seqlens_q,
     cu_seqlens_kv
 ):
+    print("call parallel_attention")
     attn1 = hybrid_seq_parallel_attn(
         None,
         q[:, :img_q_len, :, :],

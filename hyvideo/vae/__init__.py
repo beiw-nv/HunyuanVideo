@@ -130,9 +130,7 @@ def load_vae(vae_type: str="884-16c-hy",
         else:
             min_shape = opt_shape
         print(f"{opt_shape=} {max_shape=} {min_shape=}")
-        #min_shape = (1, vae.config.latent_channels, 9, 18, 16)
-        #opt_shape = (1, vae.config.latent_channels, 17, 32, 32)
-        #max_shape = (1, vae.config.latent_channels, 17, 32, 32)
+
         if not os.path.exists(engine_file):
             print(f"[I] Exporting VAE Decoder Engines: {engine_file}")
             with torch.inference_mode(), torch.autocast(
@@ -170,5 +168,5 @@ def load_vae(vae_type: str="884-16c-hy",
                 
         print("loadResource")
         vae.loadResources(device)
-                                                
+        
     return vae, vae_path, spatial_compression_ratio, time_compression_ratio

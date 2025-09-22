@@ -11,7 +11,7 @@ import torch
 import torch.distributed as dist
 from hyvideo.constants import PROMPT_TEMPLATE, NEGATIVE_PROMPT, PRECISION_TO_TYPE
 from hyvideo.vae import load_vae
-from hyvideo.modules import load_model
+from hyvideo.modules import load_model, load_trt_model
 from hyvideo.text_encoder import TextEncoder
 from hyvideo.utils.data_utils import align_to
 from hyvideo.modules.posemb_layers import get_nd_rotary_pos_embed
@@ -38,8 +38,11 @@ except:
     init_distributed_environment = None
 
 
-def parallelize_transformer(pipe):
-    transformer = pipe.transformer
+#def parallelize_transformer(pipe):
+#    transformer = pipe.transformer
+#    original_forward = transformer.forward
+def parallelize_transformer(model):
+    transformer = model
     original_forward = transformer.forward
 
     @functools.wraps(transformer.__class__.forward)
@@ -83,8 +86,8 @@ def parallelize_transformer(pipe):
         for block in transformer.double_blocks + transformer.single_blocks:
             #block.hybrid_seq_parallel_attn = xFuserLongContextAttention()
             #block.hybrid_seq_parallel_attn = xFuserLongContextAttention(ring_impl_type="basic_flashinfer", attn_type=AttnType.FLASHINFER) #flasinfer backend
-            #block.hybrid_seq_parallel_attn = xFuserLongContextAttention(ring_impl_type="basic", attn_type=AttnType.TORCH) # torch cudnn backend
-            block.hybrid_seq_parallel_attn = xFuserLongContextAttention(ring_impl_type="basic", attn_type=AttnType.FA_CUTE) # FA3 (cutlass backend)
+            block.hybrid_seq_parallel_attn = xFuserLongContextAttention(ring_impl_type="basic", attn_type=AttnType.TORCH) # torch cudnn backend
+            #block.hybrid_seq_parallel_attn = xFuserLongContextAttention(ring_impl_type="basic", attn_type=AttnType.FA_CUTE) # FA3 (cutlass backend)
 
         output = original_forward(
             x,
@@ -206,6 +209,22 @@ class Inference(object):
         model = model.to(device)
         model = Inference.load_state_dict(args, model, pretrained_model_path)
         model.eval()
+
+        if args.ulysses_degree > 1 or args.ring_degree > 1:
+            parallelize_transformer(model)
+
+        model = load_trt_model(
+            args,
+            model,
+            args.batch_size,
+            args.video_size[0],
+            args.video_size[1],
+            args.video_length,
+            device=device if not args.use_cpu_offload else "cpu",
+            model_trt=args.model_trt,
+            onnx_dir=args.onnx_dir,
+            engine_dir=args.engine_dir,
+            vae_ver=args.vae)
 
         # ============================= Build extra models ========================
         # VAE
@@ -417,8 +436,8 @@ class HunyuanVideoSampler(Inference):
         )
 
         self.default_negative_prompt = NEGATIVE_PROMPT
-        if self.parallel_args['ulysses_degree'] > 1 or self.parallel_args['ring_degree'] > 1:
-            parallelize_transformer(self.pipeline)
+        #if self.parallel_args['ulysses_degree'] > 1 or self.parallel_args['ring_degree'] > 1:
+        #    parallelize_transformer(self.pipeline)
 
     def load_diffusion_pipeline(
         self,
@@ -681,6 +700,14 @@ class HunyuanVideoSampler(Inference):
 
         if self.args.vae_trt:
             self.pipeline.vae.tearDown()
+
+        if self.args.model_trt:
+            self.pipeline.transformer.tearDown()
+            
+        if self.args.ulysses_degree > 1 or self.args.ring_degree > 1:
+            torch.distributed.barrier()
+            if torch.distributed.is_initialized():
+                torch.distributed.destroy_process_group()
             
         gen_time = time.time() - start_time
         logger.info(f"Success, time: {gen_time}")
