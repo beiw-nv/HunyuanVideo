@@ -7,6 +7,8 @@ from ..constants import VAE_PATH, PRECISION_TO_TYPE
 import tensorrt as trt
 from cuda import cudart
 
+import onnx
+from hyvideo import load, optimizer
 from ..engine import Engine
 import gc, os
 
@@ -92,30 +94,72 @@ def load_vae(vae_type: str="884-16c-hy",
                 
         if enable_tiling:
             onnx_file = os.path.join(onnx_dir, f"vae_decode_tiled_rank{os.environ['LOCAL_RANK']}.onnx")
+            onnx_opt_file = os.path.join(onnx_dir, f"vae_decode_opt_tiled_rank{os.environ['LOCAL_RANK']}.onnx")
         else:
             onnx_file = os.path.join(onnx_dir, "vae_decode.onnx")
-        if not os.path.exists(onnx_file):
-            print(f"[I] Exporting VAE Decoder ONNX: {onnx_file}")
-            with torch.inference_mode(), torch.autocast(
-                    device_type="cuda", dtype=torch.float16, enabled=True
-            ):
-                torch.onnx.export(vae_decoder,
-                                  dummy_input,
-                                  f=onnx_file,
-                                  opset_version=23,
-                                  input_names=["sample"],
-                                  output_names=["sample_output"],
-                                  dynamic_shapes={ "sample": {2: "video_length_tile", 3: "height_tile", 4: "width_tile"},
-                                                },
-                                  verbose=False,
-                                  dynamo=True,
-                                  report=False,
-                                  do_constant_folding=True)
-            gc.collect()
-            torch.cuda.empty_cache()
-        else:
-            print(f"[I] Using existing VAE Decoder ONNX: {onnx_file}")
+            onnx_opt_file = os.path.join(onnx_dir, "vae_opt_decode.onnx")
 
+        if not os.path.exists(onnx_opt_file):
+            if not os.path.exists(onnx_file):
+                print(f"[I] Exporting VAE Decoder ONNX: {onnx_file}")
+                with torch.inference_mode(), torch.autocast(
+                        device_type="cuda", dtype=torch.float16, enabled=True
+                ):
+                    torch.onnx.export(vae_decoder,
+                                      dummy_input,
+                                      f=onnx_file,
+                                      opset_version=23,
+                                      input_names=["sample"],
+                                      output_names=["sample_output"],
+                                      dynamic_shapes={ "sample": {2: "video_length_tile", 3: "height_tile", 4: "width_tile"},
+                                                      },
+                                      verbose=False,
+                                      dynamo=True,
+                                      report=False,
+                                      do_constant_folding=True)
+                    gc.collect()
+                    torch.cuda.empty_cache()
+            else:
+                print(f"[I] Found chached VAE Decoder ONNX: {onnx_file}")
+                
+            print(f"[I] Optimizing ONNX model: {onnx_opt_file}")
+            def optimize(model, onnx_graph, return_onnx=True, **kwargs):
+                opt = optimizer.Optimizer(onnx_graph, verbose=True)
+                name = model.__class__.__name__
+                opt.info(name + ": original")
+                opt.cleanup()
+                opt.info(name + ": cleanup")
+                if kwargs.get("modify_fp8_graph", False):
+                    is_fp16_io = kwargs.get("is_fp16_io", True)
+                    opt.modify_fp8_graph(is_fp16_io=is_fp16_io)
+                    opt.info(name + ": modify fp8 graph")
+                    
+                opt.fold_constants()
+                opt.info(name + ": fold constants")
+                opt.infer_shapes()
+                opt.info(name + ": shape inference")
+                
+                if kwargs.get("fuse_mha_qkv_int8", False):
+                    opt.fuse_mha_qkv_int8_sq()
+                    opt.info(name + ": fuse QKV nodes")
+                onnx_opt_graph = opt.cleanup(return_onnx=return_onnx)
+                opt.info(name + ": finished")
+                return onnx_opt_graph
+                
+            onnx_opt_graph = optimize(vae_decoder, onnx.load(onnx_file))
+            if load.onnx_graph_needs_external_data(onnx_opt_graph):
+                onnx.save_model(
+                    onnx_opt_graph,
+                    onnx_opt_file,
+                    save_as_external_data=True,
+                    all_tensors_to_one_file=True,
+                    convert_attribute=False,
+                )
+            else:
+                onnx.save(onnx_opt_graph, onnx_opt_file)   
+        else:
+            print(f"[I] Found cached optimized ONNX vae decoder: {onnx_opt_file} ")
+            
         if enable_tiling:
             engine_file = os.path.join(engine_dir, f'vae_decoder_tiled_rank{os.environ['LOCAL_RANK']}.trt'+trt.__version__+'.plan')
         else:
@@ -136,7 +180,7 @@ def load_vae(vae_type: str="884-16c-hy",
             with torch.inference_mode(), torch.autocast(
                     device_type="cuda", dtype=torch.float16, enabled=True
             ):
-                vae_engine.build(onnx_file,
+                vae_engine.build(onnx_opt_file,
                                  strongly_typed=False,
                                  fp16=True,
                                  bf16=False,

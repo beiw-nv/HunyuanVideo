@@ -36,6 +36,13 @@ cd /beiw/xDiT_beiw
 
 pip install -e .
 
+
+cd /beiw/TensorRT/tools/onnx-graphsurgeon
+make build
+cd ../
+python3 -m pip install ./onnx-graphsurgeon/dist/onnx_graphsurgeon-0.5.8-py2.py3-none-any.whl
+
+
 cd /beiw/HunyuanVideo_beiw
 
 python -m pip install -r requirements.txt

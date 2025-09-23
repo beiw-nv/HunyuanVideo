@@ -660,22 +660,17 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         feed_dict = {"x": x,
                      "t": t,
                      "text_states": text_states,
+                     "text_mask": text_mask,
                      "text_states_2": text_states_2,
                      "freqs_cos": freqs_cos,
                      "freqs_sin": freqs_sin,
                      "guidance": guidance,
-                     }
-        if self.use_attention_mask:
-            feed_dict["text_mask"] = text_mask
-        
+                     }        
         return engine.infer(feed_dict, self.stream, use_cuda_graph=self.use_cuda_graph)
 
     def get_input_names(self):
-        if self.use_attention_mask:
-            return ['x', 't', 'text_states', 'text_mask', 'text_states_2', 'freqs_cos', 'freqs_sin', 'guidance', 'return_dict']
-        else:
-            return ['x', 't', 'text_states', 'text_states_2', 'freqs_cos', 'freqs_sin', 'guidance', 'return_dict']
-        
+        return ['x', 't', 'text_states', 'text_mask', 'text_states_2', 'freqs_cos', 'freqs_sin', 'guidance', 'return_dict']
+                
     def get_output_names(self, return_dict: bool = True):
         if return_dict:
             return ['out.x']
@@ -719,6 +714,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                     (batch_size, 256, 4096),
                     (max_batch_size, 256, 4096),
                 ],
+                "text_mask": [(min_batch_size, 256),(batch_size, 256),(max_batch_size, 256)],
                 "text_states_2": [
                     (min_batch_size, 768),
                     (batch_size, 768),
@@ -735,9 +731,8 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                     (max_img_seq_len, 128),
                 ],
                 "guidance": [(min_batch_size,),(batch_size,),(max_batch_size,)],
+                #"return_dict": [(1,), (1,), (1,),],
             }
-            if self.use_attention_mask:
-                input_profile["text_mask"] = [(min_batch_size, 256),(batch_size, 256),(max_batch_size, 256)]
         else:
             raise NotImplementedError(f"[E] non-static input profile for model engine has not been implenmented")
                         
@@ -762,26 +757,16 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         dummy_guidance_expand = torch.randn(batch_size, device=device, dtype=torch.bfloat16)
         dummy_t_expand = torch.randn(batch_size, device=device, dtype=torch.float32)
 
-        if self.use_attention_mask:
-            sample_input = (dummy_latent_input,
-                            dummy_t_expand,
-                            dummy_prompt_embeds,
-                            dummy_prompt_mask,
-                            dummy_prompt_embeds2,
-                            dummy_freqs_cis0,
-                            dummy_freqs_cis1,
-                            dummy_guidance_expand,
-                            return_dict)
-        else:
-            sample_input = (dummy_latent_input,
-                            dummy_t_expand,
-                            dummy_prompt_embeds,
-                            dummy_prompt_embeds2,
-                            dummy_freqs_cis0,
-                            dummy_freqs_cis1,
-                            dummy_guidance_expand,
-                            return_dict)
-            
+        sample_input = (dummy_latent_input,
+                        dummy_t_expand,
+                        dummy_prompt_embeds,
+                        dummy_prompt_mask,
+                        dummy_prompt_embeds2,
+                        dummy_freqs_cis0,
+                        dummy_freqs_cis1,
+                        dummy_guidance_expand,
+                        return_dict)
+                 
         return sample_input
     
     def get_shape_dict(self, batch_size, latent_video_length, latent_height, latent_width, return_dict: bool = True):
@@ -798,6 +783,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             "x": latent_shape,
             "t": (batch_size,),
             "text_states": prompt_embeds_shape,
+            "text_mask": prompt_mask_shape,
             "text_states_2": prompt_embeds2_shape,
             "freqs_cos": freqs_shape,
             "freqs_sin": freqs_shape,
@@ -805,9 +791,6 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             "return_dict": (1,),
         }
         
-        if self.use_attention_mask:
-            shape_dict["text_mask"] = prompt_mask_shape
-
         if return_dict:
             shape_dict['out.x'] = latent_shape
         else:

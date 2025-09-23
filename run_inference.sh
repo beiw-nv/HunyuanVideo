@@ -18,11 +18,11 @@ export DIT_CKPT_PATH=${PATH_TO}/mp_rank_00_model_states_fp8.pt
 
 PROFILE_PATH=${SCRIPTPATH}
 ATTN=torch_cudnn
-PROFILE_FILE=hunyuanvideo_inference_${ATTN}_b200_vectmask
+PROFILE_FILE=hunyuanvideo_inference_${ATTN}_b200_vectmask_trt_opt
 
-rm -rf ./onnx/model*
-rm -rf ./engine/model*
-rm -rf model*cache.lock
+rm -rf ./onnx/*
+rm -rf ./engine/*
+rm -rf *cache.lock
 
 if [ $MULTI_GPU -eq 0 ]; then
     if [ $FP8 -eq 0 ]; then
@@ -30,7 +30,8 @@ if [ $MULTI_GPU -eq 0 ]; then
 	     python3 sample_video.py --video-size 720 1280 --video-length 129 --infer-steps 5 --prompt "A cat walks on the grass, realistic style." --flow-reverse --save-path ./results --seed 42 --vae_trt --model_trt
 	
     else
-	nsys profile -w true -t cuda,nvtx,osrt,cudnn,cublas --capture-range=cudaProfilerApi --capture-range-end=stop --cudabacktrace=true -x true -f true -o $PROFILE_PATH/${PROFILE_FILE}_fp8 python3 sample_video.py --dit-weight ${DIT_CKPT_PATH} --video-size 720 1280 --video-length 129 --infer-steps 5 --prompt "A cat walks on the grass, realistic style." --flow-reverse --use-cpu-offload --use-fp8 --save-path ./results 
+	nsys profile -w true -t cuda,nvtx,osrt,cudnn,cublas --capture-range=cudaProfilerApi --capture-range-end=stop --cudabacktrace=true -x true -f true -o $PROFILE_PATH/${PROFILE_FILE}_fp8 \
+	     python3 sample_video.py --dit-weight ${DIT_CKPT_PATH} --video-size 720 1280 --video-length 129 --infer-steps 5 --prompt "A cat walks on the grass, realistic style." --flow-reverse --save-path ./results --use-fp8 --vae_trt --model_trt
 	
     fi
 else
