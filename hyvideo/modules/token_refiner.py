@@ -5,10 +5,9 @@ import torch
 import torch.nn as nn
 
 from .activation_layers import get_activation_layer
-from .attenion import attention
+from .attenion import Attention
 from .norm_layers import get_norm_layer
 from .embed_layers import TimestepEmbedder, TextProjection
-from .attenion import attention
 from .mlp_layers import MLP
 from .modulate_layers import modulate, apply_gate
 
@@ -73,7 +72,8 @@ class IndividualTokenRefinerBlock(nn.Module):
         # Zero-initialize the modulation
         nn.init.zeros_(self.adaLN_modulation[1].weight)
         nn.init.zeros_(self.adaLN_modulation[1].bias)
-
+        self.attention = Attention()
+        
     def forward(
         self,
         x: torch.Tensor,
@@ -90,7 +90,7 @@ class IndividualTokenRefinerBlock(nn.Module):
         k = self.self_attn_k_norm(k).to(v)
 
         # Self-Attention
-        attn = attention(q, k, v, mode="torch", attn_mask=attn_mask)
+        attn = self.attention(q, k, v, attn_mask=attn_mask)
 
         x = x + apply_gate(self.self_attn_proj(attn), gate_msa)
 

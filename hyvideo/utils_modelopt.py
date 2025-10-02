@@ -125,7 +125,13 @@ def filter_func_no_proj_out(name): # used for Flux
     )
     return pattern.match(name) is not None
 
-def quantize_lvl(model_id, backbone, quant_level=2.5, linear_only=False, enable_conv_3d=True):
+
+def filter_func_hunyuanvideo(name: str) -> bool:
+    """Filter function specifically for LTX-Video models."""
+    pattern = re.compile(r".*(img_in|txt_in|time_in|vector_in|guidance_in|final_layer).*")
+    return pattern.match(name) is not None
+            
+def quantize_lvl(model_id, backbone, quant_level=2.5, linear_only=True, enable_conv_3d=True):
     """
     We should disable the unwanted quantizer when exporting the onnx
     Because in the current modelopt setting, it will load the quantizer amax for all the layers even
@@ -271,6 +277,45 @@ SD_FP8_BF16_DEFAULT_CONFIG = {
         "*k_bmm_quantizer": {"num_bits": (4, 3), "axis": None, "trt_high_precision_dtype": "BFloat16"},
         "*v_bmm_quantizer": {"num_bits": (4, 3), "axis": None, "trt_high_precision_dtype": "BFloat16"},
         "*softmax_quantizer": {
+            "num_bits": (4, 3),
+            "axis": None,
+            "trt_high_precision_dtype": "BFloat16",
+        },
+        "default": {"enable": False},
+    },
+    "algorithm": "max",
+}
+
+SD_FP8_BF16_HUNYUANVIDEO_CONFIG = {
+    "quant_cfg": {
+        "double_blocks*weight_quantizer": {"num_bits": (4, 3), "axis": None, "trt_high_precision_dtype": "BFloat16"},
+        "double_blocks*input_quantizer": {"num_bits": (4, 3), "axis": None, "trt_high_precision_dtype": "BFloat16"},
+        "double_blocks*output_quantizer": {"enable": False},
+        "double_blocks*q_bmm_quantizer": {"num_bits": (4, 3), "axis": None, "trt_high_precision_dtype": "BFloat16"},
+        "double_blocks*k_bmm_quantizer": {"num_bits": (4, 3), "axis": None, "trt_high_precision_dtype": "BFloat16"},
+        "double_blocks*v_bmm_quantizer": {"num_bits": (4, 3), "axis": None, "trt_high_precision_dtype": "BFloat16"},
+        "double_blocks*bmm2_output_quantizer": {
+            "num_bits": (4, 3),
+            "axis": None,
+            "trt_high_precision_dtype": "BFloat16",
+        },
+        "double_blocks*softmax_quantizer": {
+            "num_bits": (4, 3),
+            "axis": None,
+            "trt_high_precision_dtype": "BFloat16",
+        },
+        "single_blocks*weight_quantizer": {"num_bits": (4, 3), "axis": None, "trt_high_precision_dtype": "BFloat16"},
+        "single_blocks*input_quantizer": {"num_bits": (4, 3), "axis": None, "trt_high_precision_dtype": "BFloat16"},
+        "single_blocks*output_quantizer": {"enable": False},
+        "single_blocks*q_bmm_quantizer": {"num_bits": (4, 3), "axis": None, "trt_high_precision_dtype": "BFloat16"},
+        "single_blocks*k_bmm_quantizer": {"num_bits": (4, 3), "axis": None, "trt_high_precision_dtype": "BFloat16"},
+        "single_blocks*v_bmm_quantizer": {"num_bits": (4, 3), "axis": None, "trt_high_precision_dtype": "BFloat16"},
+        "single_blocks*softmax_quantizer": {
+            "num_bits": (4, 3),
+            "axis": None,
+            "trt_high_precision_dtype": "BFloat16",
+        },
+        "single_blocks*bmm2_output_quantizer": {
             "num_bits": (4, 3),
             "axis": None,
             "trt_high_precision_dtype": "BFloat16",

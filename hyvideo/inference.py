@@ -1,4 +1,4 @@
-import os
+import os, sys
 import time
 import random
 import functools
@@ -19,6 +19,16 @@ from hyvideo.modules.fp8_optimization import convert_fp8_linear
 from hyvideo.diffusion.schedulers import FlowMatchDiscreteScheduler
 from hyvideo.diffusion.pipelines import HunyuanVideoPipeline
 
+from hyvideo.calibrate import load_calib_prompts
+from hyvideo.utils_modelopt import (
+    SD_FP8_BF16_DEFAULT_CONFIG,
+    SD_FP8_BF16_FLUX_MMDIT_BMM2_FP8_OUTPUT_CONFIG,
+    SD_FP8_BF16_HUNYUANVIDEO_CONFIG,
+    set_quant_precision,
+    )
+import modelopt.torch.quantization as mtq
+import modelopt.torch.opt as mto
+
 try:
     import xfuser
     from xfuser.core.distributed import (
@@ -38,12 +48,12 @@ except:
     init_distributed_environment = None
 
 
-#def parallelize_transformer(pipe):
-#    transformer = pipe.transformer
-#    original_forward = transformer.forward
-def parallelize_transformer(model):
-    transformer = model
+def parallelize_transformer(pipe):
+    transformer = pipe.transformer
     original_forward = transformer.forward
+#def parallelize_transformer(model):
+#    transformer = model
+#    original_forward = transformer.forward
 
     @functools.wraps(transformer.__class__.forward)
     def new_forward(
@@ -204,27 +214,31 @@ class Inference(object):
             out_channels=out_channels,
             factor_kwargs=factor_kwargs,
         )
+        print_model=False
+        if print_model:
+            print("--- Model Details Before Conversion ---")
+            #print(model)
+            for name, module in model.named_modules():
+                if isinstance(module, torch.nn.Linear):
+                    print(f"Module: {name}")
+                    print(f"  Weight dtype: {module.weight.dtype}")
+                print("-" * 20)
         if args.use_fp8:
             convert_fp8_linear(model, args.dit_weight, original_dtype=PRECISION_TO_TYPE[args.precision])
+        if print_model:
+            print("--- Model Details After Conversion ---")
+            for name, module in model.named_modules():
+                if isinstance(module, torch.nn.Linear):
+                    print(f"Module: {name}")
+                    print(f"  Weight dtype: {module.weight.dtype}")
+                    if hasattr(module, "fp8_scale"):
+                        print(f"  FP8 Scale is present: {module.fp8_scale.item()}")
+                    else:
+                        print("  FP8 Scale is not present")
+                    print("-" * 20)
         model = model.to(device)
         model = Inference.load_state_dict(args, model, pretrained_model_path)
         model.eval()
-
-        if args.ulysses_degree > 1 or args.ring_degree > 1:
-            parallelize_transformer(model)
-
-        model = load_trt_model(
-            args,
-            model,
-            args.batch_size,
-            args.video_size[0],
-            args.video_size[1],
-            args.video_length,
-            device=device if not args.use_cpu_offload else "cpu",
-            model_trt=args.model_trt,
-            onnx_dir=args.onnx_dir,
-            engine_dir=args.engine_dir,
-            vae_ver=args.vae)
 
         # ============================= Build extra models ========================
         # VAE
@@ -436,9 +450,89 @@ class HunyuanVideoSampler(Inference):
         )
 
         self.default_negative_prompt = NEGATIVE_PROMPT
-        #if self.parallel_args['ulysses_degree'] > 1 or self.parallel_args['ring_degree'] > 1:
-        #    parallelize_transformer(self.pipeline)
-
+        
+        if self.parallel_args['ulysses_degree'] > 1 or self.parallel_args['ring_degree'] > 1:
+            parallelize_transformer(self.pipeline)
+                            
+    def get_quantized_model(self, calibration_size, calib_batch_size):
+        state_dict_path = Path(self.args.dit_modelopt_weight)
+        pipeline = self.pipeline
+        model = self.pipeline.transformer
+        if not os.path.exists(state_dict_path):
+            print(f"[I] Calibrated weights not found, generating {state_dict_path}")
+            root_dir = os.path.dirname(os.path.abspath(sys.modules["__main__"].__file__))
+            calibration_file = os.path.join(root_dir, "calibration_data", "calibration-prompts.txt")
+            calibration_prompts = load_calib_prompts(calib_batch_size, calibration_file)
+                    
+            def do_calibrate(pipeline, calibration_prompts, **kwargs):
+                for i_th, prompts in enumerate(calibration_prompts):
+                    if i_th >= kwargs["calib_size"]:
+                        return
+                    pipeline_call_kwargs = {
+                        "prompt": prompts,
+                        "height":kwargs["height"],
+                        "width": kwargs["width"],
+                        "video_length": kwargs["video_length"],
+                        "num_inference_steps": kwargs["n_steps"],
+                        "guidance_scale": kwargs["guidance_scale"],
+                        "negative_prompt": kwargs["negative_prompt"] * len(prompts),
+                        "num_video_per_prompt": kwargs["num_video_per_prompt"],
+                        "generator": kwargs["generator"],
+                        "freqs_cis": kwargs["freqs_cis"],
+                        "n_tokens": kwargs["n_tokens"],
+                        "vae_ver": kwargs["vae_ver"],
+                        "embedded_guidance_scale": kwargs["embedded_guidance_scale"],            
+                        "enable_tiling": kwargs["enable_tiling"],
+                    }
+                    pipeline(**pipeline_call_kwargs)[0]
+                    
+            target_height = align_to(self.args.video_size[0], 16)
+            target_width = align_to(self.args.video_size[1], 16)
+            freqs_cos, freqs_sin = self.get_rotary_pos_embed(self.args.video_length, target_height, target_width)
+            n_tokens = freqs_cos.shape[0]
+            seeds = [
+                self.args.seed + i
+                for _ in range(self.args.batch_size)
+                for i in range(self.args.num_videos)
+            ]
+            generator = [torch.Generator(self.device).manual_seed(seed) for seed in seeds]
+            calib_size = calibration_size // calib_batch_size
+            def forward_loop(model):
+                pipeline.transformer = model
+                
+                do_calibrate(
+                    pipeline=pipeline,
+                    calibration_prompts=calibration_prompts,
+                    calib_size=calib_size,
+                    height=target_height,
+                    width=target_width,
+                    video_length=self.args.video_length,
+                    n_steps=self.args.infer_steps,
+                    guidance_scale=self.args.cfg_scale,
+                    negative_prompt=self.default_negative_prompt,
+                    generator=generator,
+                    freqs_cis=(freqs_cos, freqs_sin),
+                    n_tokens=n_tokens,
+                    vae_ver=self.args.vae,
+                    num_video_per_prompt=self.args.num_videos,
+                    embedded_guidance_scale=self.args.embedded_cfg_scale,
+                    enable_tiling=self.args.vae_tiling
+                )
+                
+            #quant_config = SD_FP8_BF16_DEFAULT_CONFIG
+            #quant_config = SD_FP8_BF16_FLUX_MMDIT_BMM2_FP8_OUTPUT_CONFIG
+            quant_config = SD_FP8_BF16_HUNYUANVIDEO_CONFIG
+            set_quant_precision(quant_config, "BFloat16")
+            
+            mtq.quantize(model, quant_config, forward_loop)
+            mto.save(model, state_dict_path)
+            print(model)
+            #mtq.print_quant_summary(model)
+        else:
+            print(f"[I] Using existing calibrated weights {state_dict_path}")
+            
+        self.pipeline.transformer = model
+        
     def load_diffusion_pipeline(
         self,
         args,
@@ -671,7 +765,22 @@ class HunyuanVideoSampler(Inference):
                     flow_shift: {flow_shift}
        embedded_guidance_scale: {embedded_guidance_scale}"""
         logger.debug(debug_str)
-
+        
+        if self.args.use_modelopt_fp8:
+            self.get_quantized_model(calibration_size=4, calib_batch_size=1)
+            
+        if self.args.model_trt:
+            self.pipeline.transformer = load_trt_model(
+                self.args,
+                self.pipeline.transformer,
+                batch_size,
+                target_height,
+                target_width,
+                target_video_length,
+                device=self.device if not self.args.use_cpu_offload else "cpu",
+                onnx_dir=self.args.onnx_dir,
+                engine_dir=self.args.engine_dir,
+                vae_ver=self.args.vae)
         # ========================================================================
         # Pipeline inference
         # ========================================================================

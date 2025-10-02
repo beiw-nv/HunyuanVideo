@@ -45,7 +45,7 @@ def add_network_args(parser: argparse.ArgumentParser):
     )
 
     group.add_argument(
-        "--model_trt",
+        "--model-trt",
         action="store_true",
         help="Enable TRT for transformer backbone",
     )
@@ -99,13 +99,13 @@ def add_extra_models_args(parser: argparse.ArgumentParser):
         help="Output directory for ONNX export"
     )
     group.add_argument(
-        "--engine_dir",
+        "--engine-dir",
         type=str,
         default="engine",
         help="VAE decode trt engine path",
     )
     group.add_argument(
-        "--vae_trt",
+        "--vae-trt",
         action="store_true",
         help="Enable TRT for VAE decoder",
     )
@@ -270,6 +270,13 @@ def add_inference_args(parser: argparse.ArgumentParser):
         "2) named `*_model_states.pt`, where * can be `mp_rank_00`.",
     )
     group.add_argument(
+        "--dit-modelopt-weight",
+        type=str,
+        default="ckpts/hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states_modelopt_fp8.pt",
+        help="Path to the HunyuanVideo modelopt fp8 quantized model. If None, search the model in the args.model_root."
+    )
+    
+    group.add_argument(
         "--model-resolution",
         type=str,
         default="540p",
@@ -384,7 +391,15 @@ def add_inference_args(parser: argparse.ArgumentParser):
         action="store_true",
         help="Enable use fp8 for inference acceleration."
     )
-
+    group.set_defaults(use_fp8=False)
+    
+    group.add_argument(
+        "--use-modelopt-fp8",
+        action="store_true",
+        help="Enable use NVIDIA modelopt fp8 quantization for inference acceleration."
+    )
+    group.set_defaults(use_modelopt_fp8=False)
+    
     group.add_argument(
         "--reproduce",
         action="store_true",

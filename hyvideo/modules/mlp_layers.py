@@ -98,6 +98,7 @@ class FinalLayer(nn.Module):
                 hidden_size,
                 patch_size[0] * patch_size[1] * patch_size[2] * out_channels,
                 bias=True,
+                **factory_kwargs
             )
         nn.init.zeros_(self.linear.weight)
         nn.init.zeros_(self.linear.bias)

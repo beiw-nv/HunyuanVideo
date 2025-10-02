@@ -15,7 +15,7 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from .activation_layers import get_activation_layer
 from .norm_layers import get_norm_layer
 from .embed_layers import TimestepEmbedder, PatchEmbed, TextProjection
-from .attenion import attention, parallel_attention, get_cu_seqlens
+from .attenion import Attention, parallel_attention, get_cu_seqlens
 from .posemb_layers import apply_rotary_emb
 from .mlp_layers import MLP, MLPEmbedder, FinalLayer
 from .modulate_layers import ModulateDiT, modulate, apply_gate
@@ -126,6 +126,7 @@ class MMDoubleStreamBlock(nn.Module):
             **factory_kwargs,
         )
         self.hybrid_seq_parallel_attn = None
+        self.attention=Attention()
 
     def enable_deterministic(self):
         self.deterministic = True
@@ -205,7 +206,7 @@ class MMDoubleStreamBlock(nn.Module):
         
         # attention computation start
         if not self.hybrid_seq_parallel_attn:
-            attn = attention(
+            attn = self.attention(
                 q,
                 k,
                 v,
@@ -320,6 +321,7 @@ class MMSingleStreamBlock(nn.Module):
             **factory_kwargs,
         )
         self.hybrid_seq_parallel_attn = None
+        self.attention=Attention()
 
     def enable_deterministic(self):
         self.deterministic = True
@@ -369,7 +371,7 @@ class MMSingleStreamBlock(nn.Module):
         
         # attention computation start
         if not self.hybrid_seq_parallel_attn:
-            attn = attention(
+            attn = self.attention(
                 q,
                 k,
                 v,

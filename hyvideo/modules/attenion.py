@@ -65,25 +65,29 @@ def get_cu_seqlens(text_mask, img_len):
 
     return cu_seqlens
 
-
-def attention(
-        q,
-        k,
-        v,
-        mode="torch",
-        drop_rate=0,
-        attn_mask=None,
-        causal=False,
-        cu_seqlens_q=None,
-        cu_seqlens_kv=None,
-        max_seqlen_q=None,
-        max_seqlen_kv=None,
-        batch_size=1,
-):
-    """
-    Perform QKV self attention.
-
-    Args:
+class Attention(nn.Module):
+    def __init__(self):        
+        super().__init__()
+        self.mode="torch"
+        
+    def forward(
+            self,
+            q,
+            k,
+            v,
+            drop_rate=0,
+            attn_mask=None,
+            causal=False,
+            cu_seqlens_q=None,
+            cu_seqlens_kv=None,
+            max_seqlen_q=None,
+            max_seqlen_kv=None,
+            batch_size=1,
+    ):
+        """
+        Perform QKV self attention.
+        
+        Args:
         q (torch.Tensor): Query tensor with shape [b, s, a, d], where a is the number of heads.
         k (torch.Tensor): Key tensor with shape [b, s1, a, d]
         v (torch.Tensor): Value tensor with shape [b, s1, a, d]
@@ -98,104 +102,104 @@ def attention(
             used to index into kv.
         max_seqlen_q (int): The maximum sequence length in the batch of q.
         max_seqlen_kv (int): The maximum sequence length in the batch of k and v.
-
-    Returns:
+        
+        Returns:
         torch.Tensor: Output tensor after self attention with shape [b, s, ad]
-    """
-    pre_attn_layout, post_attn_layout = MEMORY_LAYOUT[mode]
-    q = pre_attn_layout(q)
-    k = pre_attn_layout(k)
-    v = pre_attn_layout(v)
-
-    if mode == "torch":
-        print("call torch attention")
-        if attn_mask is not None and attn_mask.dtype != torch.bool:
-            attn_mask = attn_mask.to(q.dtype)
+        """
+        pre_attn_layout, post_attn_layout = MEMORY_LAYOUT[self.mode]
+        q = pre_attn_layout(q)
+        k = pre_attn_layout(k)
+        v = pre_attn_layout(v)
         
-        with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
-            x = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, dropout_p=drop_rate, is_causal=causal
+        if self.mode == "torch":
+            print("call torch attention")
+            if attn_mask is not None and attn_mask.dtype != torch.bool:
+                attn_mask = attn_mask.to(q.dtype)
+                
+            with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+                x = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=attn_mask, dropout_p=drop_rate, is_causal=causal
+                )
+        elif self.mode == "flash":
+            print("call flash attention 2")
+            x = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_kv,
+                max_seqlen_q,
+                max_seqlen_kv,
             )
-    elif mode == "flash":
-        print("call flash attention 2")
-        x = flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_kv,
-            max_seqlen_q,
-            max_seqlen_kv,
-        )
-        # x with shape [(bxs), a, d]
-        x = x.view(
-            batch_size, max_seqlen_q, x.shape[-2], x.shape[-1]
-        )  # reshape x to [b, s, a, d]
-    elif mode == "te":
-        print("call TE cudnn attention")
-        os.environ["NVTE_FUSED_ATTN"] = "1"
-        os.environ["NVTE_FUSED_ATTN_BACKEND"] = "1"
-        
-        te_do_prod_attn = te.DotProductAttention(
-            num_attention_heads=q.shape[2],
-            kv_channels=q.shape[3],
-            num_gqa_groups=k.shape[2],
-            attn_mask_type="padding",
-            softmax_scale=1.0,
-            attention_dropout=0.0,
-            qkv_format="bshd"
-        )
-        
-        x = te_do_prod_attn(query_layer=q,
-                            key_layer=k,
-                            value_layer=v,
-                            cu_seqlens_q=cu_seqlens_q,
-                            cu_seqlens_kv=cu_seqlens_kv,
-                            max_seqlen_q=max_seqlen_q,
-                            max_seqlen_kv=max_seqlen_kv,
-                            attn_mask_type="padding")
-        
-    elif mode == "vanilla":
-        print("call vanilla attention")
-        scale_factor = 1 / math.sqrt(q.size(-1))
-
-        b, a, s, _ = q.shape
-        s1 = k.size(2)
-        attn_bias = torch.zeros(b, a, s, s1, dtype=q.dtype, device=q.device)
-        if causal:
-            # Only applied to self attention
-            assert (
-                attn_mask is None
-            ), "Causal mask and attn_mask cannot be used together"
-            temp_mask = torch.ones(b, a, s, s, dtype=torch.bool, device=q.device).tril(
-                diagonal=0
+            # x with shape [(bxs), a, d]
+            x = x.view(
+                batch_size, max_seqlen_q, x.shape[-2], x.shape[-1]
+            )  # reshape x to [b, s, a, d]
+        elif self.mode == "te":
+            print("call TE cudnn attention")
+            os.environ["NVTE_FUSED_ATTN"] = "1"
+            os.environ["NVTE_FUSED_ATTN_BACKEND"] = "1"
+            
+            te_do_prod_attn = te.DotProductAttention(
+                num_attention_heads=q.shape[2],
+                kv_channels=q.shape[3],
+                num_gqa_groups=k.shape[2],
+                attn_mask_type="padding",
+                softmax_scale=1.0,
+                attention_dropout=0.0,
+                qkv_format="bshd"
             )
-            attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
-            attn_bias.to(q.dtype)
-
-        if attn_mask is not None:
-            if attn_mask.dtype == torch.bool:
-                attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
-            else:
-                attn_bias += attn_mask
-
-        # TODO: Maybe force q and k to be float32 to avoid numerical overflow
-        attn = (q @ k.transpose(-2, -1)) * scale_factor
-        attn += attn_bias
-        attn = attn.softmax(dim=-1)
-        attn = torch.dropout(attn, p=drop_rate, train=False)
-        x = attn @ v
-    else:
-        raise NotImplementedError(f"Unsupported attention mode: {mode}")
-
-    x = post_attn_layout(x)
-    if mode == "cudnn":
-        out = x
-    else:
-        b, s, a, d = x.shape
-        out = x.reshape(b, s, -1)
-        
-    return out
+            
+            x = te_do_prod_attn(query_layer=q,
+                                key_layer=k,
+                                value_layer=v,
+                                cu_seqlens_q=cu_seqlens_q,
+                                cu_seqlens_kv=cu_seqlens_kv,
+                                max_seqlen_q=max_seqlen_q,
+                                max_seqlen_kv=max_seqlen_kv,
+                                attn_mask_type="padding")
+                
+        elif self.mode == "vanilla":
+            print("call vanilla attention")
+            scale_factor = 1 / math.sqrt(q.size(-1))
+            
+            b, a, s, _ = q.shape
+            s1 = k.size(2)
+            attn_bias = torch.zeros(b, a, s, s1, dtype=q.dtype, device=q.device)
+            if causal:
+                # Only applied to self attention
+                assert (
+                    attn_mask is None
+                ), "Causal mask and attn_mask cannot be used together"
+                temp_mask = torch.ones(b, a, s, s, dtype=torch.bool, device=q.device).tril(
+                    diagonal=0
+                )
+                attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+                attn_bias.to(q.dtype)
+                
+            if attn_mask is not None:
+                if attn_mask.dtype == torch.bool:
+                    attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+                else:
+                    attn_bias += attn_mask
+                    
+                    # TODO: Maybe force q and k to be float32 to avoid numerical overflow
+            attn = (q @ k.transpose(-2, -1)) * scale_factor
+            attn += attn_bias
+            attn = attn.softmax(dim=-1)
+            attn = torch.dropout(attn, p=drop_rate, train=False)
+            x = attn @ v
+        else:
+            raise NotImplementedError(f"Unsupported attention mode: {mode}")
+            
+        x = post_attn_layout(x)
+        if self.mode == "cudnn":
+            out = x
+        else:
+            b, s, a, d = x.shape
+            out = x.reshape(b, s, -1)
+            
+        return out
 
 def parallel_attention(
     hybrid_seq_parallel_attn,
