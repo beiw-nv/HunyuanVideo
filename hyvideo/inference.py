@@ -25,7 +25,10 @@ from hyvideo.utils_modelopt import (
     SD_FP8_BF16_FLUX_MMDIT_BMM2_FP8_OUTPUT_CONFIG,
     SD_FP8_BF16_HUNYUANVIDEO_CONFIG,
     set_quant_precision,
+    fp8_mha_disable,
+    filter_func_hunyuanvideo,
     )
+
 import modelopt.torch.quantization as mtq
 import modelopt.torch.opt as mto
 
@@ -217,7 +220,6 @@ class Inference(object):
         print_model=False
         if print_model:
             print("--- Model Details Before Conversion ---")
-            #print(model)
             for name, module in model.named_modules():
                 if isinstance(module, torch.nn.Linear):
                     print(f"Module: {name}")
@@ -523,10 +525,20 @@ class HunyuanVideoSampler(Inference):
             #quant_config = SD_FP8_BF16_FLUX_MMDIT_BMM2_FP8_OUTPUT_CONFIG
             quant_config = SD_FP8_BF16_HUNYUANVIDEO_CONFIG
             set_quant_precision(quant_config, "BFloat16")
-            
+            print(f"[I] Starting model quantization")
             mtq.quantize(model, quant_config, forward_loop)
+            print(f"[I] Using filter function for the model")
+            mtq.disable_quantizer(model, filter_func_hunyuanvideo)
+            print(f"[I] Disabling fp8 mha quantization")
+            fp8_mha_disable(model)
             mto.save(model, state_dict_path)
+            print("--- Model Details After Conversion ---")
             print(model)
+            #for name, module in model.named_modules():
+            #    if isinstance(module, torch.nn.Linear):
+            #        print(f"Module: {name}")
+            #        print(f"Weight dtype: {module.weight.dtype}")
+            #    print("-" * 20)
             #mtq.print_quant_summary(model)
         else:
             print(f"[I] Using existing calibrated weights {state_dict_path}")

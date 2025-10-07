@@ -120,6 +120,9 @@ class Attention(nn.Module):
                 x = F.scaled_dot_product_attention(
                     q, k, v, attn_mask=attn_mask, dropout_p=drop_rate, is_causal=causal
                 )
+            #x = F.scaled_dot_product_attention(
+            #    q, k, v, attn_mask=attn_mask, dropout_p=drop_rate, is_causal=causal
+            #    )
         elif self.mode == "flash":
             print("call flash attention 2")
             x = flash_attn_varlen_func(
@@ -183,7 +186,7 @@ class Attention(nn.Module):
                 else:
                     attn_bias += attn_mask
                     
-                    # TODO: Maybe force q and k to be float32 to avoid numerical overflow
+            # TODO: Maybe force q and k to be float32 to avoid numerical overflow
             attn = (q @ k.transpose(-2, -1)) * scale_factor
             attn += attn_bias
             attn = attn.softmax(dim=-1)

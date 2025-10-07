@@ -127,8 +127,8 @@ def filter_func_no_proj_out(name): # used for Flux
 
 
 def filter_func_hunyuanvideo(name: str) -> bool:
-    """Filter function specifically for LTX-Video models."""
-    pattern = re.compile(r".*(img_in|txt_in|time_in|vector_in|guidance_in|final_layer).*")
+    """Filter function specifically for HunyuanVideo model."""
+    pattern = re.compile(r".*(img_in|txt_in|time_in|vector_in|guidance_in|final_layer|linear2).*")
     return pattern.match(name) is not None
             
 def quantize_lvl(model_id, backbone, quant_level=2.5, linear_only=True, enable_conv_3d=True):

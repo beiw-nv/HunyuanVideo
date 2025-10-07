@@ -345,13 +345,14 @@ class MMSingleStreamBlock(nn.Module):
         qkv, mlp = torch.split(
             self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1
         )
-
+        
         q, k, v = rearrange(qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num)
 
         # Apply QK-Norm if needed.
         q = self.q_norm(q).to(v)
         k = self.k_norm(k).to(v)
 
+        fc1 = self.mlp_act(mlp)
         # Apply RoPE if needed.
         if freqs_cis is not None:
             img_q, txt_q = q[:, :-txt_len, :, :], q[:, -txt_len:, :, :]
@@ -395,7 +396,8 @@ class MMSingleStreamBlock(nn.Module):
         # attention computation end
 
         # Compute activation in mlp stream, cat again and run second linear layer.
-        output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
+        fc2 = torch.cat((attn, fc1), 2)
+        output = self.linear2(fc2)
         return x + apply_gate(output, gate=mod_gate)
 
 

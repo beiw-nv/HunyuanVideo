@@ -1,6 +1,8 @@
 #!/bin/bash
 
-#srun -A coreai_devtech_all -N1 -J coreai_devtech_all-pytorch_cudnn_attetion.inteactive_test -p batch --container-image=nvcr.io/nvidia/pytorch:25.05-py3 --container-mounts=/lustre/fsw/coreai_devtech_all/beiw:/beiw -t 04:00:00 --pty bash
+#srun -A coreai_devtech_all -N1 -J coreai_devtech_all-pytorch_cudnn_attetion.inteactive_test -p batch --container-image=nvcr.io/nvidia/pytorch:25.09-py3 --container-mounts=/lustre/fsw/coreai_devtech_all/beiw:/beiw -t 04:00:00 --pty bash
+
+srun -A coreai_devtech_all -N1 -J coreai_devtech_all-huanyuanvideo.inteactive_test -p batch -t 01:00:00 --pty /bin/bash -c "sudo nvidia-smi -ac 3996,1965 && srun --overlap --container-image=nvcr.io/nvidia/pytorch:25.09-py3 --container-mounts=/lustre/fsw/coreai_devtech_all/beiw:/beiw --pty /bin/bash"
 
 #source install.sh
 

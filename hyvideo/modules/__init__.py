@@ -9,12 +9,12 @@ import onnx
 from pathlib import Path
 import modelopt.torch.opt as mto
 import modelopt.torch.quantization as mtq
-from hyvideo.utils_modelopt import (
-    filter_func_hunyuanvideo,
-    generate_fp8_scales,
-    quantize_lvl,
-    fp8_mha_disable,
-)
+#from hyvideo.utils_modelopt import (
+#    filter_func_hunyuanvideo,
+#    generate_fp8_scales,
+#    quantize_lvl,
+#    fp8_mha_disable,
+#)
 
 from hyvideo import load, optimizer
 from ..engine import Engine
@@ -97,14 +97,14 @@ def load_trt_model(args,
                     #print("before quantize_lvl")
                     #mtq.print_quant_summary(model)
                     #quantize_lvl("hunyuan_video", model, quant_level=3, enable_conv_3d=False)
-                    mtq.disable_quantizer(model, filter_func_hunyuanvideo)
+                    #mtq.disable_quantizer(model, filter_func_hunyuanvideo)
                     #fp8_mha_disable(model)
                     print(model)
                     #mtq.print_quant_summary(model)
-                    print("--- All Parameters in the Model ---")
-                    for name, param in model.named_parameters():
-                        if 'attention' in name.lower():
-                            print(f"Parameter Name: {name}, Shape: {param.shape}")
+                    #print("--- All Parameters in the Model ---")
+                    #for name, param in model.named_parameters():
+                    #    if 'attention' in name.lower():
+                    #        print(f"Parameter Name: {name}, Shape: {param.shape}")
                             
                     #for name, param in model.named_parameters():
                     #    # 'name' is the layer and parameter name (e.g., 'conv1.weight', 'fc1.bias')
